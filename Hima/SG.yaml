@@ -1,0 +1,14 @@
+proxies:
+- name: 🇸🇬XCS MP🇸🇬
+  server: ava.game.naver.com
+  port: 443
+  type: trojan
+  password: 2166f1ec-244e-475f-bc75-d720e38eddf0
+  skip-cert-verify: true
+  sni: ava.game.naver.com.mp.whykho.web.id
+  network: ws
+  ws-opts:
+    path: /trojanws
+    headers:
+      Host: ava.game.naver.com.mp.whykho.web.id
+  udp: true
