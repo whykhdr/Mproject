@@ -1,21 +1,28 @@
 #!/bin/bash
 
 # ====================================================================
-# Skrip Auto Instalasi V2Ray (Xray-core) dengan Protokol Trojan TLS
+# Skrip Auto Instalasi V2Ray (Xray-core) dengan Protokol Trojan WS + TLS
 # Dibuat untuk VPS Ubuntu/Debian
 # Pengembang: Gemini (Google)
 # ====================================================================
 
 # --- Variabel Konfigurasi ---
-# NAMA DOMAIN ANDA YANG SUDAH DIARAHKAN KE IP VPS INI
+# NAMA DOMAIN UTAMA SERVER ANDA (untuk Sertifikat SSL/TLS dan SNI)
 DOMAIN="mp3.whykho.web.id"
 # ALAMAT EMAIL VALID ANDA UNTUK SERTIFIKAT SSL LET'S ENCRYPT
 EMAIL="mentasproject@gmail.com"
-# PORT INTERNAL V2RAY/XRAY (Jangan gunakan 80 atau 443)
-XRAY_PORT=44433 # Contoh port internal, bisa diganti.
+# PORT INTERNAL XRAY (Jangan gunakan 80 atau 443)
+XRAY_PORT=44433 # Port internal Xray untuk mendengarkan koneksi WS
+# Path WebSocket untuk Trojan
+WS_PATH="/trojanws"
+
+# ALAMAT YANG AKAN DIMASUKKAN KLIEN (bisa berbeda jika menggunakan CDN/Reverse Proxy)
+CLIENT_CONNECT_ADDRESS="vidio.whykho.web.id"
 
 # Lokasi file konfigurasi Xray
 XRAY_CONFIG_FILE="/usr/local/etc/xray/config.json"
+# Lokasi file untuk menyimpan nama akun dan UUID
+TROJAN_USERS_FILE="/etc/xray/trojan_users.json"
 
 # --- Fungsi Pembantu ---
 print_status() {
@@ -43,8 +50,18 @@ install_initial_setup() {
     print_status "Memperbarui paket sistem..."
     apt update -y && apt upgrade -y || { print_error "Gagal memperbarui sistem."; return 1; }
 
-    print_status "Menginstal dependensi yang diperlukan (curl, socat, nginx, certbot, python3-certbot-nginx)..."
-    apt install -y curl socat nginx certbot python3-certbot-nginx || { print_error "Gagal menginstal dependensi."; return 1; }
+    print_status "Menginstal dependensi yang diperlukan (curl, socat, nginx, certbot, python3-certbot-nginx, jq)..."
+    apt install -y curl socat nginx certbot python3-certbot-nginx jq || { print_error "Gagal menginstal dependensi."; return 1; }
+
+    # Pastikan direktori untuk TROJAN_USERS_FILE ada
+    print_status "Memastikan direktori $(dirname "$TROJAN_USERS_FILE") ada..."
+    mkdir -p "$(dirname "$TROJAN_USERS_FILE")" || { print_error "Gagal membuat direktori $(dirname "$TROJAN_USERS_FILE")."; return 1; }
+
+    # Inisialisasi file trojan_users.json jika belum ada
+    if [ ! -f "$TROJAN_USERS_FILE" ]; then
+        print_status "Menginisialisasi $TROJAN_USERS_FILE..."
+        echo "[]" > "$TROJAN_USERS_FILE" || { print_error "Gagal membuat $TROJAN_USERS_FILE."; return 1; }
+    fi
 
     # 2. Konfigurasi Firewall (UFW)
     print_status "Mengkonfigurasi Firewall (UFW)..."
@@ -64,11 +81,12 @@ install_initial_setup() {
     certbot certonly --standalone --agree-tos --no-eff-email --email "$EMAIL" -d "$DOMAIN" || { print_error "Gagal mendapatkan sertifikat SSL. Pastikan domain '$DOMAIN' sudah mengarah ke IP ini dan email valid."; return 1; }
     systemctl start nginx # Mulai kembali Nginx
 
-    # 5. Konfigurasi Xray-core untuk Trojan
-    print_status "Mengkonfigurasi Xray-core untuk protokol Trojan..."
+    # 5. Konfigurasi Xray-core untuk Trojan WS+TLS ---
+    print_status "Mengkonfigurasi Xray-core untuk protokol Trojan WS+TLS..."
 
     # Buat UUID baru untuk user default
     DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
+    DEFAULT_USERNAME="default-user"
 
     cat > "$XRAY_CONFIG_FILE" <<EOF
 {
@@ -84,27 +102,21 @@ install_initial_setup() {
           {
             "password": "$DEFAULT_UUID"
           }
-        ],
-        "fallbacks": [
-          {
-            "alpn": "h2",
-            "dest": 80
-          }
         ]
       },
       "streamSettings": {
-        "network": "tcp",
+        "network": "ws",
         "security": "tls",
         "tlsSettings": {
-          "alpn": [
-            "http/1.1"
-          ],
           "certificates": [
             {
               "certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
               "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"
             }
           ]
+        },
+        "wsSettings": {
+          "path": "$WS_PATH"
         }
       }
     }
@@ -118,13 +130,18 @@ install_initial_setup() {
 }
 EOF
 
+    # Tambahkan user default ke file trojan_users.json
+    jq --arg name "$DEFAULT_USERNAME" --arg uuid "$DEFAULT_UUID" \
+        '. += [{"name": $name, "uuid": $uuid}]' "$TROJAN_USERS_FILE" > temp_users.json && \
+        mv temp_users.json "$TROJAN_USERS_FILE" || { print_error "Gagal menambahkan user default ke $TROJAN_USERS_FILE."; return 1; }
+
     # Restart Xray service
     print_status "Memulai ulang layanan Xray..."
     systemctl enable xray && systemctl restart xray || { print_error "Gagal memulai ulang layanan Xray."; return 1; }
     systemctl status xray --no-pager
 
-    # 6. Konfigurasi Nginx sebagai Reverse Proxy dan Fallback Web Server
-    print_status "Mengkonfigurasi Nginx sebagai reverse proxy..."
+    # 6. Konfigurasi Nginx sebagai Reverse Proxy untuk WS+TLS ---
+    print_status "Mengkonfigurasi Nginx sebagai reverse proxy untuk WS+TLS..."
 
     cat > /etc/nginx/conf.d/v2ray.conf <<EOF
 server {
@@ -150,29 +167,26 @@ server {
     ssl_stapling on;
     ssl_stapling_verify on;
 
-    # Hapus file default nginx
-    root /var/www/html; # Ubah ke direktori web statis jika Anda punya
+    # Serve a default web page for the root path
+    root /var/www/html;
+    index index.html index.htm;
+    try_files \$uri \$uri/ =404; # Serve existing files or 404
 
-    location / {
-        # Fallback ke halaman web statis atau 404 jika bukan Trojan
-        # Anda bisa meletakkan halaman index.html di /var/www/html
-        index index.html index.htm;
-        try_files \$uri \$uri/ =404;
-    }
-
-    location /$DEFAULT_UUID { # Alamat ini tidak akan diakses langsung, hanya sebagai penanda
+    # Proxy WebSocket traffic to Xray
+    location $WS_PATH { # Ini adalah path untuk WebSocket Trojan
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:$XRAY_PORT;
+        proxy_pass http://127.0.0.1:$XRAY_PORT; # Proxy ke port internal Xray
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade \$http_upgrade; # Diperlukan untuk WebSockets
+        proxy_set_header Connection "upgrade";   # Diperlukan untuk WebSockets
         proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s; # Optional: Untuk koneksi yang lebih lama
+        proxy_send_timeout 300s; # Optional: Untuk koneksi yang lebih lama
     }
 }
 EOF
-
     # Test Nginx configuration and reload
     print_status "Memeriksa konfigurasi Nginx dan memuat ulang..."
     nginx -t && systemctl reload nginx || { print_error "Gagal mengkonfigurasi Nginx. Periksa file /etc/nginx/conf.d/v2ray.conf"; return 1; }
@@ -182,12 +196,16 @@ EOF
     echo "==================================================="
     echo "           DETAIL AKUN TROJAN DEFAULT"
     echo "==================================================="
+    echo "  Nama Akun: $DEFAULT_USERNAME"
     echo "  Protokol: Trojan"
-    echo "  Alamat:   $DOMAIN"
+    echo "  Alamat:   $CLIENT_CONNECT_ADDRESS" # Menggunakan CLIENT_CONNECT_ADDRESS
     echo "  Port:     443"
     echo "  Password: $DEFAULT_UUID"
+    echo "  Jaringan: ws (WebSocket)"
+    echo "  Path WS:  $WS_PATH"
     echo "  TLS:      True"
-    echo "  SNI:      $DOMAIN"
+    echo "  SNI:      $DOMAIN" # Tetap DOMAIN untuk SNI
+    echo "  Host WS Header: $DOMAIN" # Tetap DOMAIN untuk Host Header
     echo "  Allow Insecure: False (Rekomendasi: Jangan centang jika domain benar)"
     echo "---------------------------------------------------"
     echo "Detail ini juga bisa Anda gunakan untuk menguji koneksi."
@@ -204,11 +222,35 @@ add_trojan_user() {
         print_error "File konfigurasi Xray tidak ditemukan: $XRAY_CONFIG_FILE. Harap lakukan instalasi awal terlebih dahulu."
         return 1
     fi
+    if [ ! -f "$TROJAN_USERS_FILE" ]; then
+        print_error "File daftar user tidak ditemukan: $TROJAN_USERS_FILE. Harap lakukan instalasi awal terlebih dahulu."
+        return 1
+    fi
+
+    read -p "Masukkan nama akun baru (misal: user-ani): " NEW_USERNAME
+    if [ -z "$NEW_USERNAME" ]; then
+        print_error "Nama akun tidak boleh kosong. Pembatalan."
+        return 1
+    fi
+
+    # Cek apakah nama akun sudah ada
+    if jq -e --arg name "$NEW_USERNAME" 'map(select(.name == $name)) | length > 0' "$TROJAN_USERS_FILE" > /dev/null; then
+        print_error "Nama akun '$NEW_USERNAME' sudah ada. Harap gunakan nama lain."
+        return 1
+    fi
 
     NEW_PASSWORD=$(cat /proc/sys/kernel/random/uuid)
-    print_status "Menambahkan client baru ke konfigurasi Xray..."
+    print_status "Menambahkan client baru ke konfigurasi Xray dan daftar user..."
 
-    jq --arg pass "$NEW_PASSWORD" '.inbounds[0].settings.clients += [{"password": $pass}]' "$XRAY_CONFIG_FILE" > temp_config.json && mv temp_config.json "$XRAY_CONFIG_FILE" || { print_error "Gagal menambahkan user ke konfigurasi Xray."; return 1; }
+    # Tambahkan ke Xray config
+    jq --arg pass "$NEW_PASSWORD" '.inbounds[0].settings.clients += [{"password": $pass}]' "$XRAY_CONFIG_FILE" > temp_config.json && \
+    mv temp_config.json "$XRAY_CONFIG_FILE" || { print_error "Gagal menambahkan user ke konfigurasi Xray."; return 1; }
+
+    # Tambahkan ke trojan_users.json
+    jq --arg name "$NEW_USERNAME" --arg uuid "$NEW_PASSWORD" \
+        '. += [{"name": $name, "uuid": $uuid}]' "$TROJAN_USERS_FILE" > temp_users.json && \
+        mv temp_users.json "$TROJAN_USERS_FILE" || { print_error "Gagal menambahkan user ke $TROJAN_USERS_FILE."; return 1; }
+
 
     systemctl restart xray || { print_error "Gagal me-restart Xray setelah menambahkan user."; return 1; }
     systemctl status xray --no-pager
@@ -216,12 +258,16 @@ add_trojan_user() {
     echo "==================================================="
     echo "           DETAIL AKUN TROJAN BARU"
     echo "==================================================="
+    echo "  Nama Akun: $NEW_USERNAME"
     echo "  Protokol: Trojan"
-    echo "  Alamat:   $DOMAIN"
+    echo "  Alamat:   $CLIENT_CONNECT_ADDRESS" # Menggunakan CLIENT_CONNECT_ADDRESS
     echo "  Port:     443"
     echo "  Password: $NEW_PASSWORD"
+    echo "  Jaringan: ws (WebSocket)"
+    echo "  Path WS:  $WS_PATH"
     echo "  TLS:      True"
-    echo "  SNI:      $DOMAIN"
+    echo "  SNI:      $DOMAIN" # Tetap DOMAIN untuk SNI
+    echo "  Host WS Header: $DOMAIN" # Tetap DOMAIN untuk Host Header
     echo "  Allow Insecure: False"
     echo "---------------------------------------------------"
     echo "Gunakan detail ini untuk mengkonfigurasi klien Anda."
@@ -232,21 +278,32 @@ add_trojan_user() {
 # --- Fungsi untuk Melihat Daftar User ---
 list_trojan_users() {
     print_status "Menampilkan daftar akun Trojan yang ada..."
-    if ! check_jq_installed; then return 1; fi # Perbaikan: '}' diganti menjadi 'fi'
+    if ! check_jq_installed; then return 1; fi
 
-    if [ ! -f "$XRAY_CONFIG_FILE" ]; then
-        print_error "File konfigurasi Xray tidak ditemukan: $XRAY_CONFIG_FILE. Harap lakukan instalasi awal terlebih dahulu."
-        return 1
+    if [ ! -f "$TROJAN_USERS_FILE" ] || [ "$(cat "$TROJAN_USERS_FILE")" == "[]" ]; then
+        print_status "Tidak ada akun Trojan bernama yang ditemukan. Menampilkan UUID dari konfigurasi Xray utama."
+        if [ ! -f "$XRAY_CONFIG_FILE" ]; then
+            print_error "File konfigurasi Xray tidak ditemukan: $XRAY_CONFIG_FILE."
+            return 1
+        fi
+        echo "==================================================="
+        echo "         DAFTAR UUID TROJAN AKTIF"
+        echo "       (Tidak ada nama akun tersimpan)"
+        echo "==================================================="
+        jq -r '.inbounds[0].settings.clients[].password' "$XRAY_CONFIG_FILE" || { print_error "Gagal membaca daftar user dari konfigurasi Xray."; return 1; }
+        echo "==================================================="
+        echo "Ini adalah daftar 'password' (UUID) yang sedang aktif."
+        echo "Anda dapat menggunakan salah satu dari ini untuk koneksi."
+        echo "==================================================="
+    else
+        echo "==================================================="
+        echo "         DAFTAR AKUN TROJAN AKTIF"
+        echo "==================================================="
+        jq -r '.[] | "Nama Akun: \(.name)\nUUID: \(.uuid)\n-------------------"' "$TROJAN_USERS_FILE" || { print_error "Gagal membaca daftar user dari $TROJAN_USERS_FILE."; return 1; }
+        echo "==================================================="
+        echo "Ini adalah daftar akun Trojan Anda dengan nama dan UUID."
+        echo "==================================================="
     fi
-
-    echo "==================================================="
-    echo "         DAFTAR AKUN TROJAN AKTIF"
-    echo "==================================================="
-    jq -r '.inbounds[0].settings.clients[].password' "$XRAY_CONFIG_FILE" || { print_error "Gagal membaca daftar user dari konfigurasi Xray."; return 1; }
-    echo "==================================================="
-    echo "Ini adalah daftar 'password' (UUID) yang sedang aktif."
-    echo "Anda dapat menggunakan salah satu dari ini untuk koneksi."
-    echo "==================================================="
     return 0
 }
 
