@@ -232,7 +232,7 @@ add_trojan_user() {
 # --- Fungsi untuk Melihat Daftar User ---
 list_trojan_users() {
     print_status "Menampilkan daftar akun Trojan yang ada..."
-    if ! check_jq_installed; then return 1; }
+    if ! check_jq_installed; then return 1; fi # Perbaikan: '}' diganti menjadi 'fi'
 
     if [ ! -f "$XRAY_CONFIG_FILE" ]; then
         print_error "File konfigurasi Xray tidak ditemukan: $XRAY_CONFIG_FILE. Harap lakukan instalasi awal terlebih dahulu."
